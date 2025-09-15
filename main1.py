@@ -1,192 +1,57 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import uuid
-import os
-import datetime
-import requests
-import joblib
 import tensorflow as tf
-from PIL import Image
+import joblib
+import os
 
-# =====================
-# CONFIG & FILES
-# =====================
-FARMER_FILE = "farmers.csv"
-DISEASE_MODEL_PATH = "plant_disease_mobilenetv2.h5"
-CLASS_FILE = "class_names.txt"
-PRICE_MODEL_PATH = "crop_price_model.pkl"
-MODEL_COLS_PATH = "model_columns.pkl"
-IMG_SIZE = (224, 224)
+from models import load_models, recommend_for_farmer
 
-# =====================
-# DATA STORAGE
-# =====================
-if not os.path.exists(FARMER_FILE):
-    df = pd.DataFrame(columns=["farmer_id", "name", "location", "crop", "acres",
-                               "sowing_date", "harvest_date", "harvest_amount",
-                               "fertilizer", "yield_rate"])
-    df.to_csv(FARMER_FILE, index=False)
-
-# =====================
-# LOAD MODELS
-# =====================
-@st.cache_resource
-def load_models():
-    disease_model = tf.keras.models.load_model(DISEASE_MODEL_PATH)
-    with open(CLASS_FILE, "r") as f:
-        disease_classes = [line.strip() for line in f]
-    price_model = joblib.load(PRICE_MODEL_PATH)
-    model_columns = joblib.load(MODEL_COLS_PATH)
-    return disease_model, disease_classes, price_model, model_columns
-
+# Load models safely
 disease_model, DISEASE_CLASSES, price_model, model_columns = load_models()
 
-# =====================
-# HELPER FUNCTIONS
-# =====================
-def register_farmer(name, location):
-    farmer_id = str(uuid.uuid4())[:8]
-    df = pd.read_csv(FARMER_FILE)
-    new_farmer = pd.DataFrame([[farmer_id, name, location, "", 0, "", "", 0, "", 0]], columns=df.columns)
-    df = pd.concat([df, new_farmer], ignore_index=True)
-    df.to_csv(FARMER_FILE, index=False)
-    return farmer_id
+st.title("🌾 Smart Farming Assistant")
 
-def add_crop(farmer_id, crop, acres, sowing_date, harvest_date, harvest_amount, fertilizer):
-    df = pd.read_csv(FARMER_FILE)
-    if farmer_id not in df['farmer_id'].values:
-        return "❌ Farmer ID not found!"
-    try:
-        acres = float(acres)
-        harvest_amount = float(harvest_amount)  # in kg
-    except:
-        return "❌ Please enter valid numbers."
-    yield_rate = round(harvest_amount / acres, 2) if acres > 0 else 0
-    df.loc[df['farmer_id'] == farmer_id,
-           ["crop", "acres", "sowing_date", "harvest_date", "harvest_amount", "fertilizer", "yield_rate"]] = \
-          [crop, acres, sowing_date, harvest_date, harvest_amount, fertilizer, yield_rate]
-    df.to_csv(FARMER_FILE, index=False)
+# Farmer profile section
+st.header("👨‍🌾 Farmer Profile")
+farmer_id = st.text_input("Enter Farmer ID")
+crop = st.selectbox("Crop you sowed", ["wheat", "rice", "maize", "cotton"])
+sowing_date = st.date_input("Sowing Date")
+harvest_date = st.date_input("Expected Harvest Date")
+quantity = st.number_input("Quantity (kg)", min_value=0.0)
 
-    # Recommendations
-    if yield_rate < 1000:
-        rec = "⚠ Low yield. Try nitrogen-rich fertilizers & crop rotation."
-    else:
-        rec = "✅ Good yield! Keep same practice."
-    return f"✅ Data saved.\n📊 Yield Rate: {yield_rate} kg/acre\nRecommendation: {rec}"
+if st.button("Save Profile"):
+    st.success(f"Profile saved for Farmer {farmer_id} ✅")
 
-def preprocess_pil(img_pil):
-    img = img_pil.resize(IMG_SIZE)
-    arr = np.array(img).astype("float32")
-    if arr.shape[-1] == 4:
-        arr = arr[..., :3]
-    arr = tf.keras.applications.mobilenet_v2.preprocess_input(arr)
-    arr = np.expand_dims(arr, 0)
-    return arr
+# Disease detection section
+st.header("🦠 Crop Disease Detection")
+uploaded_img = st.file_uploader("Upload crop image", type=["jpg", "png", "jpeg"])
 
-def analyze_disease(img):
-    if img is None:
-        return "❌ Please upload an image.", None
-    arr = preprocess_pil(img)
-    preds = disease_model.predict(arr)[0]
-    top_idx = preds.argsort()[-3:][::-1]
-    result = {DISEASE_CLASSES[i]: float(preds[i]) for i in top_idx}
-    top_class = DISEASE_CLASSES[top_idx[0]]
-    return f"Detected: {top_class} ({preds[top_idx[0]]*100:.1f}%)", result
+if uploaded_img:
+    from tensorflow.keras.preprocessing import image
+    img = image.load_img(uploaded_img, target_size=(224, 224))
+    img_array = np.expand_dims(image.img_to_array(img) / 255.0, axis=0)
+    preds = disease_model.predict(img_array)
+    pred_class = DISEASE_CLASSES[np.argmax(preds)]
+    st.write(f"Prediction: *{pred_class}*")
 
-def get_weather(lat, lon, date):
-    url = f"https://archive-api.open-meteo.com/v1/archive?latitude={lat}&longitude={lon}&start_date={date}&end_date={date}&daily=temperature_2m_max,temperature_2m_min,precipitation_sum&timezone=auto"
-    r = requests.get(url).json()
-    if "daily" not in r:
-        return None
-    return {
-        "temp_max": r["daily"]["temperature_2m_max"][0],
-        "temp_min": r["daily"]["temperature_2m_min"][0],
-        "rainfall": r["daily"]["precipitation_sum"][0]
-    }
+# Price prediction section
+st.header("💰 Crop Price Prediction")
+location = st.text_input("Enter Location")
+month = st.selectbox("Month", list(range(1, 13)))
+demand = st.slider("Market Demand (1-10)", 1, 10, 5)
+temp_max = st.number_input("Max Temperature", value=30)
+temp_min = st.number_input("Min Temperature", value=20)
+rainfall = st.number_input("Rainfall (mm)", value=100)
 
-def predict_price(lat, lon, date, crop):
-    weather = get_weather(lat, lon, date)
-    if not weather:
-        return "❌ Weather unavailable"
-    features = pd.DataFrame([{
-        "temp_max": weather["temp_max"],
-        "temp_min": weather["temp_min"],
-        "rainfall": weather["rainfall"],
-        "month": datetime.datetime.strptime(date, "%Y-%m-%d").month,
-        "crop": crop,
-        "demand": 120  # dummy demand index
-    }])
-    features = pd.get_dummies(features)
-    features = features.reindex(columns=model_columns, fill_value=0)
-    price = price_model.predict(features)[0]
-    return f"📊 Predicted {crop} price on {date}: ₹{round(price,2)} / quintal"
+if st.button("Predict Price"):
+    features = pd.DataFrame([[crop, temp_max, temp_min, rainfall, month, demand]],
+                            columns=model_columns)
+    pred_price = price_model.predict(features)[0]
+    st.success(f"Predicted Price: ₹{pred_price:.2f} per kg")
 
-def view_history(farmer_id):
-    df = pd.read_csv(FARMER_FILE)
-    if farmer_id not in df['farmer_id'].values:
-        return None
-    return df[df['farmer_id'] == farmer_id]
-
-# =====================
-# STREAMLIT UI
-# =====================
-st.set_page_config(page_title="🌱 Smart Farming Assistant", layout="wide")
-st.title("🌱 Smart Farming Assistant")
-
-menu = st.sidebar.radio("Navigation", ["👤 Register Farmer", "🌾 Crop Data", "🩺 Disease Detection", "💰 Price Prediction", "📊 Farmer History"])
-
-if menu == "👤 Register Farmer":
-    st.header("Register Farmer")
-    name = st.text_input("Farmer Name")
-    location = st.text_input("Location")
-    if st.button("Register"):
-        if name and location:
-            fid = register_farmer(name, location)
-            st.success(f"✅ Farmer registered! ID: {fid}")
-        else:
-            st.error("Please enter all details.")
-
-elif menu == "🌾 Crop Data":
-    st.header("Add Crop Data")
-    fid = st.text_input("Farmer ID")
-    crop = st.text_input("Crop Name")
-    acres = st.number_input("Acres", min_value=0.1, step=0.1)
-    sowing = st.date_input("Sowing Date")
-    harvest = st.date_input("Harvest Date")
-    amount = st.number_input("Harvest Amount (kg)", min_value=0.0, step=10.0)
-    fert = st.text_input("Fertilizer Used")
-    if st.button("Save Crop Data"):
-        result = add_crop(fid, crop, acres, sowing, harvest, amount, fert)
-        st.info(result)
-
-elif menu == "🩺 Disease Detection":
-    st.header("Upload Crop Image")
-    img = st.file_uploader("Upload Leaf Image", type=["jpg", "jpeg", "png"])
-    if img:
-        image = Image.open(img)
-        st.image(image, caption="Uploaded Image", use_column_width=True)
-        if st.button("Analyze"):
-            res, top3 = analyze_disease(image)
-            st.success(res)
-            st.write("Top Predictions:", top3)
-
-elif menu == "💰 Price Prediction":
-    st.header("Predict Crop Price")
-    lat = st.number_input("Latitude", value=28.6)
-    lon = st.number_input("Longitude", value=77.2)
-    date = st.date_input("Date")
-    crop2 = st.text_input("Crop Name")
-    if st.button("Predict Price"):
-        result = predict_price(lat, lon, str(date), crop2)
-        st.info(result)
-
-elif menu == "📊 Farmer History":
-    st.header("Farmer History")
-    fid = st.text_input("Farmer ID")
-    if st.button("View History"):
-        hist = view_history(fid)
-        if hist is None or hist.empty:
-            st.error("❌ No data found for this farmer.")
-        else:
-            st.dataframe(hist)
+# Recommendations
+st.header("📊 Smart Recommendations")
+if st.button("Get Recommendations"):
+    rec = recommend_for_farmer(crop)
+    st.write(rec)
