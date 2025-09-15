@@ -1,400 +1,192 @@
-# agri_ews_streamlit_app.py
-# Complete single-file Streamlit agriculture "Early Warning System (EWS)" style app
-# Features included:
-# - Dummy dataset generation for crops, prices, disease symptoms
-# - Model training (price regression, disease classification)
-# - Streamlit multi-page UI: Home, Price Predictor, Disease Detector (tabular), Weather (mock), Chatbot, Marketplace, Research
-# - Simple chatbot based on retrieval + small rule-based responses
-# - Admin panel to retrain models and download datasets
-# - Uses scikit-learn, pandas, numpy, matplotlib
-
 import streamlit as st
 import pandas as pd
 import numpy as np
+import uuid
 import os
-import io
+import datetime
+import requests
 import joblib
-from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_squared_error, accuracy_score
-from sklearn.preprocessing import StandardScaler
-import matplotlib.pyplot as plt
-from datetime import datetime, timedelta
+import tensorflow as tf
+from PIL import Image
 
-# --------------------- Helpers & Dummy Data ---------------------
-@st.cache_data
-def generate_price_dataset(n=2000, random_state=42):
-    rng = np.random.RandomState(random_state)
-    dates = pd.date_range(end=pd.Timestamp.today(), periods=n).to_pydatetime().tolist()
-    crops = ['Wheat', 'Rice', 'Maize', 'Tomato', 'Potato', 'Onion']
-    data = []
-    for i in range(n):
-        crop = rng.choice(crops)
-        base_price = {'Wheat':1800, 'Rice':2500, 'Maize':1500,'Tomato':8000,'Potato':1200,'Onion':6000}[crop]
-        seasonality = 1 + 0.2*np.sin(i/30)
-        rainfall = max(0, rng.normal(80, 40)) # mm
-        temperature = rng.normal(25, 6) # C
-        demand_index = rng.normal(100, 20)
-        price = base_price * seasonality * (1 + (100-rainfall)/500) * (1 + (30-temperature)/200) * (demand_index/100)
-        price = max(100, price + rng.normal(0, base_price*0.05))
-        data.append([dates[i], crop, rainfall, temperature, demand_index, price])
-    df = pd.DataFrame(data, columns=['date','crop','rainfall_mm','temperature_c','demand_index','price_pkr'])
-    return df
+# =====================
+# CONFIG & FILES
+# =====================
+FARMER_FILE = "farmers.csv"
+DISEASE_MODEL_PATH = "plant_disease_mobilenetv2.h5"
+CLASS_FILE = "class_names.txt"
+PRICE_MODEL_PATH = "crop_price_model.pkl"
+MODEL_COLS_PATH = "model_columns.pkl"
+IMG_SIZE = (224, 224)
 
-@st.cache_data
-def generate_disease_dataset(n=2000, random_state=24):
-    rng = np.random.RandomState(random_state)
-    crops = ['Tomato','Potato','Wheat']
-    diseases = {
-        'Tomato':['Late Blight','Leaf Spot','Healthy'],
-        'Potato':['Early Blight','Late Blight','Healthy'],
-        'Wheat':['Rust','Healthy']
-    }
-    rows = []
-    for i in range(n):
-        crop = rng.choice(crops)
-        if crop=='Tomato': possibilities = diseases['Tomato']
-        elif crop=='Potato': possibilities = diseases['Potato']
-        else: possibilities = diseases['Wheat']
-        # Build a probability vector that matches length of possibilities
-        if len(possibilities) == 3:
-            p = [0.25, 0.25, 0.5]  # two diseases + healthy
-        elif len(possibilities) == 2:
-            p = [0.5, 0.5]  # disease vs healthy
-        else:
-            # fallback equal probs
-            p = [1.0/len(possibilities)] * len(possibilities)
-        label = rng.choice(possibilities, p=p)
-        # symptoms: spots, yellowing, wilting, lesion_size
-        spots = int(rng.poisson(2 if label!='Healthy' else 0))
-        if label=='Healthy':
-            yellowing = int(rng.choice([0,1], p=[0.8,0.2]))
-            wilting = int(rng.choice([0,1], p=[0.85,0.15]))
-            lesion_size = float(abs(rng.normal(0.05,0.05)))
-        else:
-            yellowing = int(rng.choice([0,1], p=[0.3,0.7]))
-            wilting = int(rng.choice([0,1], p=[0.3,0.7]))
-            lesion_size = float(abs(rng.normal(0.5,1.0)))
-        humidity = float(rng.normal(70,10))
-        temperature = float(rng.normal(24,5))
-        rows.append([crop, spots, yellowing, wilting, lesion_size, humidity, temperature, label])
-    df = pd.DataFrame(rows, columns=['crop','spots_count','yellowing','wilting','lesion_size_cm','humidity_pct','temperature_c','disease'])
-    return df
+# =====================
+# DATA STORAGE
+# =====================
+if not os.path.exists(FARMER_FILE):
+    df = pd.DataFrame(columns=["farmer_id", "name", "location", "crop", "acres",
+                               "sowing_date", "harvest_date", "harvest_amount",
+                               "fertilizer", "yield_rate"])
+    df.to_csv(FARMER_FILE, index=False)
 
-# File paths to save models/datasets
-MODEL_DIR = 'models'
-os.makedirs(MODEL_DIR, exist_ok=True)
-PRICE_MODEL_PATH = os.path.join(MODEL_DIR,'price_model.joblib')
-DISEASE_MODEL_PATH = os.path.join(MODEL_DIR,'disease_model.joblib')
-SCALER_PATH = os.path.join(MODEL_DIR,'scaler.joblib')  # price scaler
-DISEASE_SCALER_PATH = os.path.join(MODEL_DIR,'disease_scaler.joblib')
-DISEASE_FEATURES_PATH = os.path.join(MODEL_DIR,'disease_feature_cols.joblib')
-
+# =====================
+# LOAD MODELS
+# =====================
 @st.cache_resource
-def train_price_model(df):
-    df2 = df.copy()
-    # One-hot encode crop column
-    df2 = pd.get_dummies(df2, columns=['crop'], drop_first=True)
+def load_models():
+    disease_model = tf.keras.models.load_model(DISEASE_MODEL_PATH)
+    with open(CLASS_FILE, "r") as f:
+        disease_classes = [line.strip() for line in f]
+    price_model = joblib.load(PRICE_MODEL_PATH)
+    model_columns = joblib.load(MODEL_COLS_PATH)
+    return disease_model, disease_classes, price_model, model_columns
 
-    # Features (X) and target (y)
-    X = df2[['rainfall_mm','temperature_c','demand_index'] 
-            + [c for c in df2.columns if c.startswith('crop_')]]
-    y = df2['price_pkr']
+disease_model, DISEASE_CLASSES, price_model, model_columns = load_models()
 
-    # Split into train/test
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=1
-    )
+# =====================
+# HELPER FUNCTIONS
+# =====================
+def register_farmer(name, location):
+    farmer_id = str(uuid.uuid4())[:8]
+    df = pd.read_csv(FARMER_FILE)
+    new_farmer = pd.DataFrame([[farmer_id, name, location, "", 0, "", "", 0, "", 0]], columns=df.columns)
+    df = pd.concat([df, new_farmer], ignore_index=True)
+    df.to_csv(FARMER_FILE, index=False)
+    return farmer_id
 
-    # Scale features
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_test_scaled = scaler.transform(X_test)
-
-    # Train Random Forest
-    model = RandomForestRegressor(n_estimators=120, random_state=1)
-    model.fit(X_train_scaled, y_train)
-
-    # Evaluate RMSE (safe across sklearn versions)
-    preds = model.predict(X_test_scaled)
+def add_crop(farmer_id, crop, acres, sowing_date, harvest_date, harvest_amount, fertilizer):
+    df = pd.read_csv(FARMER_FILE)
+    if farmer_id not in df['farmer_id'].values:
+        return "❌ Farmer ID not found!"
     try:
-        # Newer sklearn (>=0.22)
-        rmse = mean_squared_error(y_test, preds, squared=False)
-    except TypeError:
-        # Older sklearn
-        rmse = np.sqrt(mean_squared_error(y_test, preds))
+        acres = float(acres)
+        harvest_amount = float(harvest_amount)  # in kg
+    except:
+        return "❌ Please enter valid numbers."
+    yield_rate = round(harvest_amount / acres, 2) if acres > 0 else 0
+    df.loc[df['farmer_id'] == farmer_id,
+           ["crop", "acres", "sowing_date", "harvest_date", "harvest_amount", "fertilizer", "yield_rate"]] = \
+          [crop, acres, sowing_date, harvest_date, harvest_amount, fertilizer, yield_rate]
+    df.to_csv(FARMER_FILE, index=False)
 
-    # Save model + scaler
-    joblib.dump(model, PRICE_MODEL_PATH)
-    joblib.dump(scaler, SCALER_PATH)
-
-    return model, scaler, rmse
-
-@st.cache_resource
-def train_disease_model(df):
-    df2 = df.copy()
-    df2 = pd.get_dummies(df2, columns=['crop'], drop_first=True)
-    feature_cols = ['spots_count','yellowing','wilting','lesion_size_cm','humidity_pct','temperature_c'] + [c for c in df2.columns if c.startswith('crop_')]
-    X = df2[feature_cols]
-    y = df2['disease']
-    X_train, X_test, y_train, y_test = train_test_split(X,y,test_size=0.2, random_state=2)
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_test_scaled = scaler.transform(X_test)
-    clf = RandomForestClassifier(n_estimators=120, random_state=2)
-    clf.fit(X_train_scaled, y_train)
-    preds = clf.predict(X_test_scaled)
-    acc = accuracy_score(y_test, preds)
-    joblib.dump(clf, DISEASE_MODEL_PATH)
-    joblib.dump(scaler, DISEASE_SCALER_PATH)
-    joblib.dump(feature_cols, DISEASE_FEATURES_PATH)
-    return clf, scaler, acc
-
-# Utility loaders
-def load_price_model():
-    if os.path.exists(PRICE_MODEL_PATH) and os.path.exists(SCALER_PATH):
-        model = joblib.load(PRICE_MODEL_PATH)
-        scaler = joblib.load(SCALER_PATH)
-        return model, scaler
-    return None, None
-
-def load_disease_model():
-    if os.path.exists(DISEASE_MODEL_PATH) and os.path.exists(DISEASE_SCALER_PATH) and os.path.exists(DISEASE_FEATURES_PATH):
-        clf = joblib.load(DISEASE_MODEL_PATH)
-        scaler = joblib.load(DISEASE_SCALER_PATH)
-        feature_cols = joblib.load(DISEASE_FEATURES_PATH)
-        return clf, scaler, feature_cols
-    return None, None, None
-
-# --------------------- Simple Chatbot (retrieval + rules) ---------------------
-class SimpleChatbot:
-    def __init__(self, diseases_df=None, price_df=None):   # <-- fixed: __init_
-        # store datasets inside the chatbot
-        self.diseases_df = diseases_df
-        self.price_df = price_df
-
-    def reply(self, text):
-        text_l = text.lower()
-
-        # --- Crop price query ---
-        if self.price_df is not None and ('price' in text_l or 'market' in text_l):
-            for c in self.price_df['crop'].unique():
-                if c.lower() in text_l:
-                    recent = self.price_df[self.price_df['crop']==c].sort_values(
-                        'date', ascending=False
-                    ).iloc[:7]
-                    mean_price = int(recent['price_pkr'].mean())
-                    return f"📊 Recent average {c} price ≈ ₹{mean_price} per quintal."
-            return "Which crop price do you want? (e.g., Wheat, Rice, Tomato)."
-
-        # --- Disease query ---
-        if self.diseases_df is not None:
-            for _, row in self.diseases_df.iterrows():
-                if row['disease'].lower() in text_l:
-                    return (
-                        f"🦠 Disease: {row['disease']}\n"
-                        f"Symptoms: {row['spots_count']} spots, yellowing={row['yellowing']}, "
-                        f"wilting={row['wilting']}\n👉 Possible treatment: Consult expert."
-                    )
-
-        # --- Help ---
-        if 'help' in text_l:
-            return "You can ask about prices, diseases, or weather."
-
-        # --- Fallback ---
-        return "❌ Sorry, I didn’t understand. Try asking about crop prices or diseases."
-
-# --------------------- Streamlit Layout ---------------------
-st.set_page_config(page_title='Agri EWS - Streamlit', layout='wide')
-
-# Load or create datasets
-price_df = generate_price_dataset(1600)
-disease_df = generate_disease_dataset(1200)
-chatbot = SimpleChatbot(diseases_df=disease_df, price_df=price_df)
-
-# Sidebar navigation
-st.sidebar.title('Navigation')
-page = st.sidebar.radio('Go to', ['Home','Price Predictor','Disease Detector','Weather','Chatbot','Marketplace','Research','Admin'])
-
-# --- HOME ---
-if page=='Home':
-    st.title('Agriculture Early Warning System (EWS) — Demo')
-    st.markdown(
-        """
-        This demo app bundles several features commonly requested in agriculture projects:
-        - Price forecasting for crops (dummy data)
-        - Tabular disease detection (symptom-based)
-        - Simple weather mock/alerts
-        - Chatbot for quick queries
-        - Marketplace mockup for selling produce
-        - Research/Downloads and Admin for retraining models
-        """
-    )
-    st.subheader('Quick visuals')
-    crop = st.selectbox('Select crop to view price trend', price_df['crop'].unique())
-    subset = price_df[price_df['crop']==crop].sort_values('date')
-    fig, ax = plt.subplots()
-    ax.plot(pd.to_datetime(subset['date']), subset['price_pkr'])
-    ax.set_title(f'{crop} price trend (dummy)')
-    ax.set_ylabel('Price')
-    st.pyplot(fig)
-    st.info('This app uses dummy datasets. Use Admin -> Retrain to simulate model training on these datasets.')
-
-# --- PRICE PREDICTOR ---
-elif page=='Price Predictor':
-    st.title('Price Predictor')
-    st.markdown('Enter features to predict crop price (per quintal).')
-    crop = st.selectbox('Crop', price_df['crop'].unique())
-    rainfall = st.number_input('Rainfall (mm)', min_value=0.0, value=50.0)
-    temp = st.number_input('Temperature (°C)', value=25.0)
-    demand = st.number_input('Demand index (0-200)', min_value=10.0, max_value=300.0, value=100.0)
-    if st.button('Predict Price'):
-        model, scaler = load_price_model()
-        df_for_cols = pd.get_dummies(price_df[['crop']].copy(), columns=['crop'], drop_first=True)
-        crop_cols = [c for c in df_for_cols.columns if c.startswith('crop_')]
-        inp = { 'rainfall_mm': rainfall, 'temperature_c': temp, 'demand_index': demand }
-        for col in crop_cols:
-            inp[col] = 1 if col==f'crop_{crop}' else 0
-        X = pd.DataFrame([inp])
-        # Ensure X has same column order used in training
-        ordered_cols = ['rainfall_mm','temperature_c','demand_index'] + crop_cols
-        X = X[ordered_cols]
-        if model is None or scaler is None:
-            st.warning('Model not trained yet. Go to Admin -> Retrain models to train on dummy data.')
-        else:
-            X_scaled = scaler.transform(X)
-            pred = model.predict(X_scaled)[0]
-            st.success(f'Predicted price for {crop}: ₹{pred:.2f} per quintal (dummy model).')
-
-# --- DISEASE DETECTOR (TABULAR) ---
-elif page=='Disease Detector':
-    st.title('Disease Detector (symptom-based)')
-    st.markdown('Input simple symptom values to get a disease prediction.')
-    crop = st.selectbox('Crop', disease_df['crop'].unique())
-    spots = st.number_input('Spots count', min_value=0, value=1)
-    yellowing = st.selectbox('Yellowing (0/1)', [0,1])
-    wilting = st.selectbox('Wilting (0/1)', [0,1])
-    lesion = st.number_input('Lesion size (cm)', value=0.2)
-    humidity = st.number_input('Humidity (%)', min_value=0.0, max_value=100.0, value=70.0)
-    temp = st.number_input('Temperature (°C)', value=24.0)
-    if st.button('Predict Disease'):
-        clf, scaler_d, feat_cols = load_disease_model()
-        if clf is None or scaler_d is None or feat_cols is None:
-            st.warning('Disease model not trained yet. Go to Admin -> Retrain models to train on dummy data.')
-        else:
-            # build input respecting the same feature columns used in training
-            inp = {'spots_count':spots,'yellowing':yellowing,'wilting':wilting,'lesion_size_cm':lesion,'humidity_pct':humidity,'temperature_c':temp}
-            # collect crop dummy columns from training features (those starting with 'crop_')
-            crop_dummy_cols = [c for c in feat_cols if c.startswith('crop_')]
-            for col in crop_dummy_cols:
-                inp[col] = 1 if col==f'crop_{crop}' else 0
-            X = pd.DataFrame([inp])
-            # ensure columns are in feature order
-            X = X[feat_cols]
-            X_scaled = scaler_d.transform(X)
-            pred = clf.predict(X_scaled)
-            proba = clf.predict_proba(X_scaled) if hasattr(clf,'predict_proba') else None
-            st.success(f'Predicted: {pred[0]}')
-            if proba is not None:
-                top_idx = np.argmax(proba[0])
-                st.write('Confidence (top class):', f'{proba[0][top_idx]*100:.1f}%')
-
-# --- WEATHER (Mock) ---
-elif page=='Weather':
-    st.title('Weather & Alerts (Mock)')
-    st.markdown('This page shows a simple mock weather forecast and alerting rules for the demo.')
-    location = st.text_input('Location (name)', 'Local Farm')
-    days = st.slider('Days to forecast', 1, 7, 3)
-    base = pd.Timestamp.today()
-    rows=[]
-    for i in range(days):
-        d = base + pd.Timedelta(days=i)
-        temp = float(20 + 10*np.sin(i/3) + np.random.randn()*2)
-        rain = float(max(0, np.random.normal(60,40)))
-        rows.append({'date':d.date(),'temp_c':temp,'rain_mm':rain})
-    dfw = pd.DataFrame(rows)
-    st.table(dfw)
-    # simple alert rule
-    heavy_rain = dfw[dfw['rain_mm']>100]
-    if not heavy_rain.empty:
-        st.warning('Heavy rain expected on: ' + ', '.join(str(d) for d in heavy_rain['date'].tolist()))
+    # Recommendations
+    if yield_rate < 1000:
+        rec = "⚠ Low yield. Try nitrogen-rich fertilizers & crop rotation."
     else:
-        st.success('No heavy rain alerts in the next {} days (mock data).'.format(days))
+        rec = "✅ Good yield! Keep same practice."
+    return f"✅ Data saved.\n📊 Yield Rate: {yield_rate} kg/acre\nRecommendation: {rec}"
 
-# --- CHATBOT ---
-elif page=='Chatbot':
-    st.title('Quick Chatbot')
-    st.markdown('Ask about crop prices, diseases, or features.')
-    user_input = st.text_input('Message')
-    if st.button('Send'):
-        if user_input.strip()=='' :
-            st.info('Please type a message.')
+def preprocess_pil(img_pil):
+    img = img_pil.resize(IMG_SIZE)
+    arr = np.array(img).astype("float32")
+    if arr.shape[-1] == 4:
+        arr = arr[..., :3]
+    arr = tf.keras.applications.mobilenet_v2.preprocess_input(arr)
+    arr = np.expand_dims(arr, 0)
+    return arr
+
+def analyze_disease(img):
+    if img is None:
+        return "❌ Please upload an image.", None
+    arr = preprocess_pil(img)
+    preds = disease_model.predict(arr)[0]
+    top_idx = preds.argsort()[-3:][::-1]
+    result = {DISEASE_CLASSES[i]: float(preds[i]) for i in top_idx}
+    top_class = DISEASE_CLASSES[top_idx[0]]
+    return f"Detected: {top_class} ({preds[top_idx[0]]*100:.1f}%)", result
+
+def get_weather(lat, lon, date):
+    url = f"https://archive-api.open-meteo.com/v1/archive?latitude={lat}&longitude={lon}&start_date={date}&end_date={date}&daily=temperature_2m_max,temperature_2m_min,precipitation_sum&timezone=auto"
+    r = requests.get(url).json()
+    if "daily" not in r:
+        return None
+    return {
+        "temp_max": r["daily"]["temperature_2m_max"][0],
+        "temp_min": r["daily"]["temperature_2m_min"][0],
+        "rainfall": r["daily"]["precipitation_sum"][0]
+    }
+
+def predict_price(lat, lon, date, crop):
+    weather = get_weather(lat, lon, date)
+    if not weather:
+        return "❌ Weather unavailable"
+    features = pd.DataFrame([{
+        "temp_max": weather["temp_max"],
+        "temp_min": weather["temp_min"],
+        "rainfall": weather["rainfall"],
+        "month": datetime.datetime.strptime(date, "%Y-%m-%d").month,
+        "crop": crop,
+        "demand": 120  # dummy demand index
+    }])
+    features = pd.get_dummies(features)
+    features = features.reindex(columns=model_columns, fill_value=0)
+    price = price_model.predict(features)[0]
+    return f"📊 Predicted {crop} price on {date}: ₹{round(price,2)} / quintal"
+
+def view_history(farmer_id):
+    df = pd.read_csv(FARMER_FILE)
+    if farmer_id not in df['farmer_id'].values:
+        return None
+    return df[df['farmer_id'] == farmer_id]
+
+# =====================
+# STREAMLIT UI
+# =====================
+st.set_page_config(page_title="🌱 Smart Farming Assistant", layout="wide")
+st.title("🌱 Smart Farming Assistant")
+
+menu = st.sidebar.radio("Navigation", ["👤 Register Farmer", "🌾 Crop Data", "🩺 Disease Detection", "💰 Price Prediction", "📊 Farmer History"])
+
+if menu == "👤 Register Farmer":
+    st.header("Register Farmer")
+    name = st.text_input("Farmer Name")
+    location = st.text_input("Location")
+    if st.button("Register"):
+        if name and location:
+            fid = register_farmer(name, location)
+            st.success(f"✅ Farmer registered! ID: {fid}")
         else:
-            reply = chatbot.reply(user_input)
-            st.markdown('*You:* ' + user_input)
-            st.markdown('*Bot:* ' + reply)
+            st.error("Please enter all details.")
 
-# --- MARKETPLACE ---
-elif page=='Marketplace':
-    st.title('Marketplace (Mock)')
-    st.markdown('List produce for sale or browse entries from simulated farmers.')
-    col1, col2 = st.columns(2)
-    with col1:
-        st.subheader('List your produce')
-        seller = st.text_input('Seller name')
-        crop = st.selectbox('Crop to sell', price_df['crop'].unique(), key='market_crop')
-        qty = st.number_input('Quantity (quintals)', value=5)
-        price = st.number_input('Asking price per quintal', value=1000.0)
-        contact = st.text_input('Contact info')
-        if st.button('Post Listing'):
-            st.success('Listing posted (mock). It would appear in the Market Listings below.')
-    with col2:
-        st.subheader('Browse listings')
-        sample_listings = []
-        for i in range(5):
-            sample_listings.append({'seller':f'Farmer {i+1}','crop':np.random.choice(price_df['crop'].unique()),'qty':np.random.randint(1,50),'price':np.random.randint(800,5000)})
-        st.table(pd.DataFrame(sample_listings))
+elif menu == "🌾 Crop Data":
+    st.header("Add Crop Data")
+    fid = st.text_input("Farmer ID")
+    crop = st.text_input("Crop Name")
+    acres = st.number_input("Acres", min_value=0.1, step=0.1)
+    sowing = st.date_input("Sowing Date")
+    harvest = st.date_input("Harvest Date")
+    amount = st.number_input("Harvest Amount (kg)", min_value=0.0, step=10.0)
+    fert = st.text_input("Fertilizer Used")
+    if st.button("Save Crop Data"):
+        result = add_crop(fid, crop, acres, sowing, harvest, amount, fert)
+        st.info(result)
 
-# --- RESEARCH ---
-elif page=='Research':
-    st.title('Research / Downloads')
-    st.markdown('This section provides quick dataset summaries and allows downloading the dummy data used for training.')
-    if st.button('Show dataset summaries'):
-        st.subheader('Price dataset head')
-        st.dataframe(price_df.head())
-        st.subheader('Disease dataset head')
-        st.dataframe(disease_df.head())
-    buf = io.BytesIO()
-    with st.expander('Download datasets'):
-        csv1 = price_df.to_csv(index=False).encode()
-        csv2 = disease_df.to_csv(index=False).encode()
-        st.download_button('Download price dataset (CSV)', csv1, file_name='price_dataset.csv')
-        st.download_button('Download disease dataset (CSV)', csv2, file_name='disease_dataset.csv')
+elif menu == "🩺 Disease Detection":
+    st.header("Upload Crop Image")
+    img = st.file_uploader("Upload Leaf Image", type=["jpg", "jpeg", "png"])
+    if img:
+        image = Image.open(img)
+        st.image(image, caption="Uploaded Image", use_column_width=True)
+        if st.button("Analyze"):
+            res, top3 = analyze_disease(image)
+            st.success(res)
+            st.write("Top Predictions:", top3)
 
-# --- ADMIN ---
-elif page=='Admin':
-    st.title('Admin — Train models & Diagnostics')
-    st.markdown('Train models on dummy data and inspect evaluation metrics. Use this to simulate EWS model updates.')
-    st.subheader('Train price model')
-    if st.button('Train price model on dummy data'):
-        with st.spinner('Training price model...'):
-            model, scaler, rmse = train_price_model(price_df)
-            st.success(f'Price model trained. RMSE on holdout ≈ {rmse:.2f}')
-    st.subheader('Train disease model')
-    if st.button('Train disease model on dummy data'):
-        with st.spinner('Training disease model...'):
-            clf, scaler2, acc = train_disease_model(disease_df)
-            st.success(f'Disease model trained. Accuracy on holdout ≈ {acc*100:.1f}%')
-    st.subheader('Current model status')
-    pm, sc = load_price_model()
-    dm_clf, dm_scaler, dm_feats = load_disease_model()
-    st.write('Price model present:', bool(pm))
-    st.write('Disease model present:', bool(dm_clf))
-    if dm_feats is not None:
-        st.write('Disease model feature columns count:', len(dm_feats))
-    st.markdown('---')
-    st.write('Note: Models and datasets here are for demo/prototyping only. Do not use as-is in production.')
+elif menu == "💰 Price Prediction":
+    st.header("Predict Crop Price")
+    lat = st.number_input("Latitude", value=28.6)
+    lon = st.number_input("Longitude", value=77.2)
+    date = st.date_input("Date")
+    crop2 = st.text_input("Crop Name")
+    if st.button("Predict Price"):
+        result = predict_price(lat, lon, str(date), crop2)
+        st.info(result)
 
-# Footer
-st.sidebar.markdown('---')
-st.sidebar.caption('Agri EWS demo — single-file Streamlit app. Modify and extend for your project needs.')
+elif menu == "📊 Farmer History":
+    st.header("Farmer History")
+    fid = st.text_input("Farmer ID")
+    if st.button("View History"):
+        hist = view_history(fid)
+        if hist is None or hist.empty:
+            st.error("❌ No data found for this farmer.")
+        else:
+            st.dataframe(hist)

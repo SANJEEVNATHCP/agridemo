@@ -18,3 +18,5 @@ apscheduler
 beautifulsoup4
 sqlalchemy
 schedule
+tensorflow
+PIL
