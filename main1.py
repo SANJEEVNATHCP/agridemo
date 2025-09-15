@@ -16,7 +16,7 @@ import io
 import joblib
 from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_squared_error, accuracy_score, classification_report
+from sklearn.metrics import mean_squared_error, accuracy_score
 from sklearn.preprocessing import StandardScaler
 import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
@@ -56,14 +56,27 @@ def generate_disease_dataset(n=2000, random_state=24):
         if crop=='Tomato': possibilities = diseases['Tomato']
         elif crop=='Potato': possibilities = diseases['Potato']
         else: possibilities = diseases['Wheat']
-        label = rng.choice(possibilities, p=[0.25,0.25,0.5] if 'Healthy' in possibilities else [0.5,0.5])
+        # Build a probability vector that matches length of possibilities
+        if len(possibilities) == 3:
+            p = [0.25, 0.25, 0.5]  # two diseases + healthy
+        elif len(possibilities) == 2:
+            p = [0.5, 0.5]  # disease vs healthy
+        else:
+            # fallback equal probs
+            p = [1.0/len(possibilities)] * len(possibilities)
+        label = rng.choice(possibilities, p=p)
         # symptoms: spots, yellowing, wilting, lesion_size
-        spots = rng.poisson(2 if label!='Healthy' else 0)
-        yellowing = rng.choice([0,1], p=[0.8,0.2]) if label=='Healthy' else rng.choice([0,1], p=[0.3,0.7])
-        wilting = rng.choice([0,1], p=[0.85,0.15]) if label=='Healthy' else rng.choice([0,1], p=[0.3,0.7])
-        lesion_size = float(rng.normal(0.5,1.0)) if label!='Healthy' else float(abs(rng.normal(0.05,0.05)))
-        humidity = rng.normal(70,10)
-        temperature = rng.normal(24,5)
+        spots = int(rng.poisson(2 if label!='Healthy' else 0))
+        if label=='Healthy':
+            yellowing = int(rng.choice([0,1], p=[0.8,0.2]))
+            wilting = int(rng.choice([0,1], p=[0.85,0.15]))
+            lesion_size = float(abs(rng.normal(0.05,0.05)))
+        else:
+            yellowing = int(rng.choice([0,1], p=[0.3,0.7]))
+            wilting = int(rng.choice([0,1], p=[0.3,0.7]))
+            lesion_size = float(abs(rng.normal(0.5,1.0)))
+        humidity = float(rng.normal(70,10))
+        temperature = float(rng.normal(24,5))
         rows.append([crop, spots, yellowing, wilting, lesion_size, humidity, temperature, label])
     df = pd.DataFrame(rows, columns=['crop','spots_count','yellowing','wilting','lesion_size_cm','humidity_pct','temperature_c','disease'])
     return df
@@ -73,32 +86,56 @@ MODEL_DIR = 'models'
 os.makedirs(MODEL_DIR, exist_ok=True)
 PRICE_MODEL_PATH = os.path.join(MODEL_DIR,'price_model.joblib')
 DISEASE_MODEL_PATH = os.path.join(MODEL_DIR,'disease_model.joblib')
-SCALER_PATH = os.path.join(MODEL_DIR,'scaler.joblib')
+SCALER_PATH = os.path.join(MODEL_DIR,'scaler.joblib')  # price scaler
+DISEASE_SCALER_PATH = os.path.join(MODEL_DIR,'disease_scaler.joblib')
+DISEASE_FEATURES_PATH = os.path.join(MODEL_DIR,'disease_feature_cols.joblib')
 
-# --------------------- Model training / load ---------------------
 @st.cache_resource
 def train_price_model(df):
     df2 = df.copy()
+    # One-hot encode crop column
     df2 = pd.get_dummies(df2, columns=['crop'], drop_first=True)
-    X = df2[['rainfall_mm','temperature_c','demand_index'] + [c for c in df2.columns if c.startswith('crop_')]]
+
+    # Features (X) and target (y)
+    X = df2[['rainfall_mm','temperature_c','demand_index'] 
+            + [c for c in df2.columns if c.startswith('crop_')]]
     y = df2['price_pkr']
-    X_train, X_test, y_train, y_test = train_test_split(X,y,test_size=0.2, random_state=1)
+
+    # Split into train/test
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=1
+    )
+
+    # Scale features
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train)
     X_test_scaled = scaler.transform(X_test)
+
+    # Train Random Forest
     model = RandomForestRegressor(n_estimators=120, random_state=1)
     model.fit(X_train_scaled, y_train)
+
+    # Evaluate RMSE (safe across sklearn versions)
     preds = model.predict(X_test_scaled)
-    rmse = mean_squared_error(y_test, preds, squared=False)
+    try:
+        # Newer sklearn (>=0.22)
+        rmse = mean_squared_error(y_test, preds, squared=False)
+    except TypeError:
+        # Older sklearn
+        rmse = np.sqrt(mean_squared_error(y_test, preds))
+
+    # Save model + scaler
     joblib.dump(model, PRICE_MODEL_PATH)
     joblib.dump(scaler, SCALER_PATH)
+
     return model, scaler, rmse
 
 @st.cache_resource
 def train_disease_model(df):
     df2 = df.copy()
     df2 = pd.get_dummies(df2, columns=['crop'], drop_first=True)
-    X = df2[['spots_count','yellowing','wilting','lesion_size_cm','humidity_pct','temperature_c'] + [c for c in df2.columns if c.startswith('crop_')]]
+    feature_cols = ['spots_count','yellowing','wilting','lesion_size_cm','humidity_pct','temperature_c'] + [c for c in df2.columns if c.startswith('crop_')]
+    X = df2[feature_cols]
     y = df2['disease']
     X_train, X_test, y_train, y_test = train_test_split(X,y,test_size=0.2, random_state=2)
     scaler = StandardScaler()
@@ -109,7 +146,8 @@ def train_disease_model(df):
     preds = clf.predict(X_test_scaled)
     acc = accuracy_score(y_test, preds)
     joblib.dump(clf, DISEASE_MODEL_PATH)
-    # we overwrite scaler from price training if exists; store disease scaler separately if needed
+    joblib.dump(scaler, DISEASE_SCALER_PATH)
+    joblib.dump(feature_cols, DISEASE_FEATURES_PATH)
     return clf, scaler, acc
 
 # Utility loaders
@@ -121,37 +159,50 @@ def load_price_model():
     return None, None
 
 def load_disease_model():
-    if os.path.exists(DISEASE_MODEL_PATH):
+    if os.path.exists(DISEASE_MODEL_PATH) and os.path.exists(DISEASE_SCALER_PATH) and os.path.exists(DISEASE_FEATURES_PATH):
         clf = joblib.load(DISEASE_MODEL_PATH)
-        return clf
-    return None
+        scaler = joblib.load(DISEASE_SCALER_PATH)
+        feature_cols = joblib.load(DISEASE_FEATURES_PATH)
+        return clf, scaler, feature_cols
+    return None, None, None
 
 # --------------------- Simple Chatbot (retrieval + rules) ---------------------
 class SimpleChatbot:
-    def __init__(self, price_df, disease_df):
+    def __init__(self, diseases_df=None, price_df=None):   # <-- fixed: __init_
+        # store datasets inside the chatbot
+        self.diseases_df = diseases_df
         self.price_df = price_df
-        self.disease_df = disease_df
+
     def reply(self, text):
         text_l = text.lower()
-        if 'price' in text_l or 'market' in text_l:
-            crop = None
+
+        # --- Crop price query ---
+        if self.price_df is not None and ('price' in text_l or 'market' in text_l):
             for c in self.price_df['crop'].unique():
                 if c.lower() in text_l:
-                    crop = c
-                    break
-            if crop is None:
-                return "Which crop? (e.g., Wheat, Rice, Tomato)."
-            recent = self.price_df[self.price_df['crop']==crop].sort_values('date',ascending=False).iloc[:7]
-            mean_price = int(recent['price_pkr'].mean())
-            return f"Recent average {crop} price ≈ ₹{mean_price} per quintal (based on dummy data)."
-        if 'disease' in text_l or 'leaf' in text_l or 'blight' in text_l:
-            return "Describe symptoms: spots count, yellowing (0/1), wilting (0/1), lesion_size_cm, humidity, temperature. I can predict disease from that." 
-        if 'help' in text_l or 'features' in text_l:
-            return "This EWS app has: Price prediction, Disease detection, Weather mockup, Marketplace, Research notes, and an admin retrain panel." 
-        # fallback: simple retrieval from research dataset
-        if 'research' in text_l or 'paper' in text_l:
-            return "Check Research page — there are example dataset summaries and links to further reading (mock)."
-        return "Sorry, I didn't understand. Ask about price, disease, weather, or features."
+                    recent = self.price_df[self.price_df['crop']==c].sort_values(
+                        'date', ascending=False
+                    ).iloc[:7]
+                    mean_price = int(recent['price_pkr'].mean())
+                    return f"📊 Recent average {c} price ≈ ₹{mean_price} per quintal."
+            return "Which crop price do you want? (e.g., Wheat, Rice, Tomato)."
+
+        # --- Disease query ---
+        if self.diseases_df is not None:
+            for _, row in self.diseases_df.iterrows():
+                if row['disease'].lower() in text_l:
+                    return (
+                        f"🦠 Disease: {row['disease']}\n"
+                        f"Symptoms: {row['spots_count']} spots, yellowing={row['yellowing']}, "
+                        f"wilting={row['wilting']}\n👉 Possible treatment: Consult expert."
+                    )
+
+        # --- Help ---
+        if 'help' in text_l:
+            return "You can ask about prices, diseases, or weather."
+
+        # --- Fallback ---
+        return "❌ Sorry, I didn’t understand. Try asking about crop prices or diseases."
 
 # --------------------- Streamlit Layout ---------------------
 st.set_page_config(page_title='Agri EWS - Streamlit', layout='wide')
@@ -159,7 +210,7 @@ st.set_page_config(page_title='Agri EWS - Streamlit', layout='wide')
 # Load or create datasets
 price_df = generate_price_dataset(1600)
 disease_df = generate_disease_dataset(1200)
-chatbot = SimpleChatbot(price_df,disease_df)
+chatbot = SimpleChatbot(diseases_df=disease_df, price_df=price_df)
 
 # Sidebar navigation
 st.sidebar.title('Navigation')
@@ -205,6 +256,9 @@ elif page=='Price Predictor':
         for col in crop_cols:
             inp[col] = 1 if col==f'crop_{crop}' else 0
         X = pd.DataFrame([inp])
+        # Ensure X has same column order used in training
+        ordered_cols = ['rainfall_mm','temperature_c','demand_index'] + crop_cols
+        X = X[ordered_cols]
         if model is None or scaler is None:
             st.warning('Model not trained yet. Go to Admin -> Retrain models to train on dummy data.')
         else:
@@ -224,20 +278,22 @@ elif page=='Disease Detector':
     humidity = st.number_input('Humidity (%)', min_value=0.0, max_value=100.0, value=70.0)
     temp = st.number_input('Temperature (°C)', value=24.0)
     if st.button('Predict Disease'):
-        clf = load_disease_model()
-        if clf is None:
+        clf, scaler_d, feat_cols = load_disease_model()
+        if clf is None or scaler_d is None or feat_cols is None:
             st.warning('Disease model not trained yet. Go to Admin -> Retrain models to train on dummy data.')
         else:
-            # prepare input same way as training
-            df_cols = pd.get_dummies(disease_df[['crop']].copy(), columns=['crop'], drop_first=True)
-            crop_cols = [c for c in df_cols.columns if c.startswith('crop_')]
+            # build input respecting the same feature columns used in training
             inp = {'spots_count':spots,'yellowing':yellowing,'wilting':wilting,'lesion_size_cm':lesion,'humidity_pct':humidity,'temperature_c':temp}
-            for col in crop_cols:
+            # collect crop dummy columns from training features (those starting with 'crop_')
+            crop_dummy_cols = [c for c in feat_cols if c.startswith('crop_')]
+            for col in crop_dummy_cols:
                 inp[col] = 1 if col==f'crop_{crop}' else 0
             X = pd.DataFrame([inp])
-            # we used a scaler during training but didn't persist disease scaler earlier; do simple predict
-            pred = clf.predict(X.values)
-            proba = clf.predict_proba(X.values) if hasattr(clf,'predict_proba') else None
+            # ensure columns are in feature order
+            X = X[feat_cols]
+            X_scaled = scaler_d.transform(X)
+            pred = clf.predict(X_scaled)
+            proba = clf.predict_proba(X_scaled) if hasattr(clf,'predict_proba') else None
             st.success(f'Predicted: {pred[0]}')
             if proba is not None:
                 top_idx = np.argmax(proba[0])
@@ -275,8 +331,8 @@ elif page=='Chatbot':
             st.info('Please type a message.')
         else:
             reply = chatbot.reply(user_input)
-            st.markdown('**You:** ' + user_input)
-            st.markdown('**Bot:** ' + reply)
+            st.markdown('*You:* ' + user_input)
+            st.markdown('*Bot:* ' + reply)
 
 # --- MARKETPLACE ---
 elif page=='Marketplace':
@@ -331,9 +387,11 @@ elif page=='Admin':
             st.success(f'Disease model trained. Accuracy on holdout ≈ {acc*100:.1f}%')
     st.subheader('Current model status')
     pm, sc = load_price_model()
-    dm = load_disease_model()
+    dm_clf, dm_scaler, dm_feats = load_disease_model()
     st.write('Price model present:', bool(pm))
-    st.write('Disease model present:', bool(dm))
+    st.write('Disease model present:', bool(dm_clf))
+    if dm_feats is not None:
+        st.write('Disease model feature columns count:', len(dm_feats))
     st.markdown('---')
     st.write('Note: Models and datasets here are for demo/prototyping only. Do not use as-is in production.')
 
