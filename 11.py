@@ -40,11 +40,11 @@ if uploaded_file:
     st.plotly_chart(fig_sales, use_container_width=True)
     
     # Cash flow over time
-    fig_cash = px.line(df, x='Date', y='CashFlow', title="Cash Flow Over Time", line_color='green')
+    fig_cash = go.line(df, x='Date', y='CashFlow', title="Cash Flow Over Time", line_color='green')
     st.plotly_chart(fig_cash, use_container_width=True)
     
     # Inventory over time
-    fig_inv = px.line(df, x='Date', y='Inventory', title="Inventory Over Time", line_color='orange')
+    fig_inv = gp.line(df, x='Date', y='Inventory', title="Inventory Over Time", line_color='orange')
     st.plotly_chart(fig_inv, use_container_width=True)
     
     # -------------------
@@ -95,4 +95,5 @@ if uploaded_file:
         
 else:
     st.info("Please upload a CSV file to continue.")
+
 
