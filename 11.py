@@ -3,6 +3,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
+import plotly.graph_objects as go
 
 st.set_page_config(page_title="MSME Early Warning System", layout="wide")
 
@@ -94,3 +95,4 @@ if uploaded_file:
         
 else:
     st.info("Please upload a CSV file to continue.")
+
