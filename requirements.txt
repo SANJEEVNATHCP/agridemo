@@ -9,3 +9,4 @@ keras
 h5py
 pillow
 plotly
+google-generativeai
