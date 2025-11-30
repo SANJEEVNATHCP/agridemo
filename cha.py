@@ -11,7 +11,7 @@ st.title("🤖 Gemini Chatbot")
 
 # Option 2: Sidebar input (for development)
 with st.sidebar:
-    api_key = st.text_input("Enter your Gemini API Key", type="password")
+    api_key = st.text_input("AIzaSyBpJ8ncsHHKwmks1Se9nVUlBm2AEG9yOEA", type="password")
     st.markdown("[Get an API key](https://aistudio.google.com/app/apikey)")
     model_name = st.selectbox(
         "Select Model",
